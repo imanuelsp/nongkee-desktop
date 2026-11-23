@@ -1,14 +1,19 @@
 """Nongkee native client. Only the Python standard library is required."""
+import base64
+import hashlib
 import json
+import secrets
+import webbrowser
+from pathlib import Path
 import os
 import tkinter as tk
 from http.cookiejar import CookieJar
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
-GREEN, LIME, INK, WHITE = "#00c060", "#b8ff66", "#173329", "#ffffff"
+GREEN, LIME, INK, WHITE = "#14543b", "#d6f5af", "#173329", "#ffffff"
 
 
 class Client:
@@ -22,7 +27,7 @@ class Client:
 
     def request(self, path, data=None):
         headers = {"Accept": "application/json", "X-CSRFToken": self.csrf, "Referer": self.base + "/"}
-        body = urlencode(data).encode() if data is not None else None
+        body = urlencode(data, doseq=True).encode() if data is not None else None
         try:
             with self.http.open(Request(self.base + path, body, headers), timeout=6) as response:
                 result = json.load(response)
@@ -43,6 +48,11 @@ class App:
         self.api = Client()
         self.section = "Open Meets"
         root.title("nongkee")
+        style = ttk.Style(root)
+        style.theme_use("clam")
+        style.configure("TButton", font=("Segoe UI", 10), padding=(12, 6), background="#e5f3dc")
+        style.configure("TLabel", font=("Segoe UI", 10), background=WHITE, foreground=INK)
+        style.configure("TEntry", padding=5)
         root.geometry("1060x740")
         root.minsize(720, 540)
         root.configure(bg=WHITE)
@@ -81,7 +91,7 @@ class App:
             widget.destroy()
         self.canvas.yview_moveto(0)
         for label, button in self.nav.items():
-            button.configure(bg=LIME if label == self.section else GREEN)
+            button.configure(bg=LIME if label == self.section else GREEN, fg=INK if label == self.section else WHITE)
         tk.Label(self.body, text="Katalog Kelas Kosong" if self.section == "Kelas Kosong" else self.section,
                  bg=WHITE, font=("Segoe UI", 23, "bold"), pady=18).pack()
         ttk.Button(self.body, text="Muat ulang", command=self.show).pack(anchor="e")
@@ -97,16 +107,35 @@ class App:
         elif self.section == "Kelas Kosong":
             self.slot_picker(self.body, False)
         else:
-            grid = tk.Frame(self.body, bg=WHITE)
-            grid.pack(fill="x", pady=12)
-            for col in range(3):
-                grid.columnconfigure(col, weight=1, uniform="card")
-            self.card(grid, 0, "⊕", WHITE, self.create)
-            for i, meet in enumerate(self.data["meets"], 1):
+            self.meet_grid()
+
+    def meet_grid(self):
+        search = self.field(self.body, "Cari judul, topik, atau ruang")
+        mine = tk.BooleanVar()
+        grid = tk.Frame(self.body, bg=WHITE)
+        def draw(event=None):
+            query = search.get().strip().casefold()
+            for child in grid.winfo_children():
+                child.destroy()
+            self.card(grid, 0, "⊕\nStart a Meet", WHITE, self.create)
+            count = 0
+            for meet in self.data["meets"]:
+                joined = meet["is_host"] or meet["status"] == "joined"
+                if (mine.get() and not joined) or query not in " ".join(meet[k] for k in ("title", "room", "host", "topic")).casefold():
+                    continue
+                count += 1
                 initials = [n[:1].upper() for n in meet["attendees"][:3]]
-                label = f"{meet['title']}\nopened by: {meet['host']}\n{meet['topic']} · {meet['room']}"
-                self.card(grid, i, label, GREEN if meet["is_host"] or meet["status"] == "joined" else LIME,
-                          lambda m=meet: self.detail(m), initials)
+                label = f"{meet['title']}\n{meet['date']} · {meet['window']}\n{meet['topic']} · {meet['room']}"
+                self.card(grid, count, label, GREEN if joined else LIME, lambda m=meet: self.detail(m), initials)
+            if not count:
+                ttk.Label(grid, text="Belum ada meet yang cocok.", wraplength=150).grid(row=0, column=1)
+        if self.data["user"]:
+            ttk.Checkbutton(self.body, text="Meet saya", variable=mine, command=draw).pack(anchor="w")
+        grid.pack(fill="x", pady=12)
+        for col in range(3):
+            grid.columnconfigure(col, weight=1, uniform="card")
+        search.bind("<KeyRelease>", draw)
+        draw()
 
     def card(self, grid, i, label, color, command, initials=()):
         card = tk.Canvas(grid, width=1, height=166, bg=WHITE, highlightthickness=1,
@@ -125,8 +154,8 @@ class App:
                 card.create_oval(x-16, 15, x+16, 47, fill=WHITE, outline=GREEN, width=2)
                 card.create_text(x, 31, text=initial, fill=INK, font=("Segoe UI", 11, "bold"))
             card.create_text(w/2, h*0.61 if initials else h/2, text=label, width=w-18,
-                             justify="center", fill=INK if initials else GREEN,
-                             font=("Segoe UI", 10 if initials else 24, "bold"))
+                             justify="center", fill=WHITE if color == GREEN else INK if initials else GREEN,
+                             font=("Segoe UI", 10 if initials else 16, "bold"))
         card.bind("<Configure>", draw)
         for event in ("<Button-1>", "<Return>", "<space>"):
             card.bind(event, lambda e: command())
@@ -169,38 +198,136 @@ class App:
         action = "signup" if signup else "login"
         ttk.Button(win, text="Create account" if signup else "Sign in", command=lambda: self.finish(
             win, f"/api/account/{action}/", {key: entry.get() for key, entry in fields.items()})).pack(pady=6)
+        if self.data.get("google_enabled"):
+            ttk.Button(win, text="Lanjutkan dengan Google", command=lambda: self.google(win)).pack(pady=5)
         if not signup:
             def register():
                 win.destroy()
                 self.auth(True)
             ttk.Button(win, text="Create account", command=register).pack()
 
+    def google(self, parent):
+        verifier = secrets.token_urlsafe(32)
+        challenge = hashlib.sha256(verifier.encode()).hexdigest()
+        url = self.api.base + "/auth/desktop/?" + urlencode({"challenge": challenge})
+        webbrowser.open(url)
+        parent.destroy()
+        win = self.dialog("Masuk dengan Google")
+        ttk.Label(win, text="Masuk di browser, lalu tempel kode sekali pakai di sini.").pack()
+        ttk.Button(win, text="Buka kembali browser", command=lambda: webbrowser.open(url)).pack()
+        code = self.field(win, "Kode dari browser")
+        ttk.Button(win, text="Masuk", command=lambda: self.finish(win, "/auth/desktop/redeem/",
+                   {"code": code.get().strip(), "verifier": verifier})).pack()
+
+    def portrait(self, parent, url):
+        if not url:
+            return
+        try:
+            with self.api.http.open(self.api.base + url, timeout=5) as response:
+                photo = tk.PhotoImage(data=base64.b64encode(response.read())).subsample(2, 2)
+            label = ttk.Label(parent, image=photo)
+            label.image = photo
+            label.pack(side="left", padx=6)
+        except (OSError, tk.TclError):
+            pass
+
     def profile(self):
-        user = self.data["user"]
-        if not user:
+        if not self.data["user"]:
             return self.auth()
-        win = self.dialog("Profil")
-        ttk.Label(win, text=user["email"]).pack(anchor="w")
-        display = self.field(win, "Nama tampilan", user["name"])
-        ttk.Button(win, text="Simpan profil", command=lambda: self.finish(win, "/profile/", {"first_name": display.get()})).pack()
-        ttk.Label(win, text="Mahasiswa UI · Belum terverifikasi").pack(pady=10)
-        ttk.Button(win, text="Verifikasi mahasiswa UI", command=lambda: messagebox.showinfo(
+        info = self.api.request("/profile/")
+        user = info["user"]
+        win = self.dialog("Profil saya")
+        book = ttk.Notebook(win)
+        book.pack(fill="both", expand=True)
+        personal, courses, account = (ttk.Frame(book, padding=12) for _ in range(3))
+        for tab, label in [(personal, "Identitas"), (courses, "Kelas saya"), (account, "Akun")]:
+            book.add(tab, text=label)
+        top = ttk.Frame(personal)
+        top.pack(fill="x")
+        self.portrait(top, user["avatar"])
+        ttk.Label(top, text="@" + user["handle"]).pack(side="left")
+        display = self.field(personal, "Nama tampilan", user["name"])
+        handle = self.field(personal, "Username unik", user["handle"])
+        interests = self.field(personal, "Minat (pisahkan dengan koma)", ", ".join(user["interests"]))
+        photo = {}
+        filename = tk.StringVar(value="Pilih PNG, JPEG, atau WebP hingga 2 MB")
+        def choose():
+            path = filedialog.askopenfilename(parent=win, filetypes=[("Foto", "*.png *.jpg *.jpeg *.webp")])
+            if path:
+                file = Path(path)
+                if file.stat().st_size > 2 * 1024 * 1024:
+                    raise ValueError("Ukuran foto maksimal 2 MB.")
+                photo.clear()
+                photo["photo_base64"] = base64.b64encode(file.read_bytes()).decode()
+                filename.set(file.name)
+        def remove():
+            photo.clear()
+            photo["remove_photo"] = "on"
+            filename.set("Foto akan dihapus saat disimpan")
+        ttk.Label(personal, textvariable=filename).pack(anchor="w")
+        ttk.Button(personal, text="Ganti foto", command=choose).pack(anchor="w")
+        ttk.Button(personal, text="Hapus foto", command=remove).pack(anchor="w")
+
+        next_slot = user["next_class"]
+        if next_slot:
+            ttk.Label(courses, text=f"Kelas berikutnya · {next_slot['label']}\n{next_slot['date']} · {next_slot['time']} WIB · {next_slot['room']}",
+                      wraplength=420).pack(anchor="w", pady=5)
+        search = self.field(courses, "Cari kelas atau rombel")
+        selected = set(user["classes"])
+        options = tk.Listbox(courses, height=8, width=52, exportselection=False)
+        options.pack(fill="both", expand=True)
+        def refresh(event=None):
+            options.delete(0, "end")
+            for label in info["catalogue"]:
+                if search.get().casefold() in label.casefold():
+                    options.insert("end", ("✓  " if label in selected else "   ") + label)
+        def toggle(event=None):
+            if options.curselection():
+                index = options.curselection()[0]
+                label = options.get(index)[3:]
+                selected.symmetric_difference_update([label])
+                refresh()
+                options.selection_set(index)
+                options.see(index)
+        search.bind("<KeyRelease>", refresh)
+        options.bind("<Double-Button-1>", toggle)
+        options.bind("<space>", toggle)
+        ttk.Button(courses, text="Pilih / lepaskan kelas", command=toggle).pack()
+        refresh()
+        def save():
+            self.finish(win, "/profile/", dict(first_name=display.get(), handle=handle.get(), interests=interests.get(),
+                                              classes_present="1", classes=sorted(selected), **photo))
+        ttk.Button(win, text="Simpan profil", command=save).pack(pady=8)
+        ttk.Label(account, text=user["email"]).pack(anchor="w")
+        ttk.Label(account, text="Mahasiswa UI · Belum terverifikasi").pack(pady=10)
+        ttk.Button(account, text="Verifikasi mahasiswa UI", command=lambda: messagebox.showinfo(
             "SSO UI", self.api.request("/profile/verify/", {})["message"], parent=win)).pack()
-        ttk.Button(win, text="Sign out", command=lambda: self.finish(win, "/api/account/logout/", {})).pack(pady=8)
+        if self.data.get("google_enabled"):
+            ttk.Button(account, text="Kelola Google di browser", command=lambda: webbrowser.open(self.api.base + "/profile/")).pack()
+        ttk.Button(account, text="Sign out", command=lambda: self.finish(win, "/api/account/logout/", {})).pack(pady=8)
 
     def friends(self):
-        email = self.field(self.body, "Email teman")
+        handle = self.field(self.body, "Username teman")
         def update(fields):
             self.api.request("/friends/", fields)
             self.show()
-        ttk.Button(self.body, text="Tambah teman", command=lambda: update({"action": "invite", "email": email.get()})).pack(anchor="w")
+        ttk.Button(self.body, text="Kirim undangan", command=lambda: update({"action": "invite", "handle": handle.get()})).pack(anchor="w")
         people = self.api.request("/friends/")["people"]
         if not people:
-            ttk.Label(self.body, text="Belum ada teman.").pack(pady=12)
+            ttk.Label(self.body, text="Belum ada teman. Bagikan @" + self.data["user"]["handle"]).pack(pady=12)
         for person in people:
             row = tk.Frame(self.body, bg=LIME, padx=12, pady=10)
             row.pack(fill="x", pady=4)
-            tk.Label(row, bg=LIME, text=person["name"] + " · " + person["status"]).pack(side="left")
+            self.portrait(row, person["avatar"])
+            lines = [person["name"] + " · @" + person["handle"], person["status"]]
+            if person["shared_classes"]:
+                lines.append("This person is in your class · " + ", ".join(person["shared_classes"]))
+            if person["shared_interests"]:
+                lines.append("Minat bersama · " + ", ".join(person["shared_interests"]))
+            tk.Label(row, bg=LIME, justify="left", wraplength=340, text="\n".join(lines)).pack(side="left")
+            if person["status"] != "Friends":
+                ttk.Button(row, text="Tarik" if person["status"] == "Terkirim" else "Tolak",
+                           command=lambda i=person["id"]: update({"action": "dismiss", "id": i})).pack(side="right")
             if person["status"] == "Permintaan masuk":
                 ttk.Button(row, text="Terima", command=lambda i=person["id"]: update({"action": "accept", "id": i})).pack(side="right")
 
@@ -213,13 +340,15 @@ class App:
         building = self.choice(win, "Area", list(buildings))
         rooms = tk.Listbox(win, height=6 if picker else 14, exportselection=False)
         options = []
+        free_only = tk.BooleanVar(value=picker)
         def refresh(*args):
             options.clear()
             rooms.delete(0, "end")
             query = urlencode(dict(date=date.get(), window=window.get(), building=buildings[building.get()], picker=int(picker)))
-            options.extend(self.api.request("/api/state/?" + query)["rooms"])
+            options.extend(room for room in self.api.request("/api/state/?" + query)["rooms"] if not free_only.get() or not room["busy"])
             for room in options:
                 rooms.insert("end", ("Terisi" if room["busy"] else "Tersedia") + "   ·   " + room["name"])
+        ttk.Checkbutton(win, text="Hanya ruang kosong", variable=free_only, command=refresh).pack(anchor="w")
         ttk.Button(win, text="Cari kelas", command=refresh).pack(anchor="w", pady=4)
         rooms.pack(fill="both", expand=True)
         def clear(event):
